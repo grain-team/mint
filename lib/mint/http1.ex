@@ -225,47 +225,43 @@ defmodule Mint.HTTP1 do
     {:error, conn, wrap_error(:closed)}
   end
 
-  def request(
-        %__MODULE__{request: %{state: {:stream_request, _}}} = conn,
-        _method,
-        _path,
-        _headers,
-        _body
-      ) do
-    {:error, conn, wrap_error(:request_body_is_streaming)}
-  end
-
   def request(%__MODULE__{} = conn, method, path, headers, body) do
-    %__MODULE__{transport: transport, socket: socket} = conn
+    case last_request(conn) do
+      %{state: {:stream_request, _}} ->
+        {:error, conn, wrap_error(:request_body_is_streaming)}
 
-    headers =
-      headers
-      |> lower_header_keys()
-      |> add_default_headers(conn)
+      _ ->
+        %__MODULE__{transport: transport, socket: socket} = conn
 
-    with {:ok, headers, encoding} <- add_content_length_or_transfer_encoding(headers, body),
-         {:ok, iodata} <- Request.encode(method, path, headers, body),
-         :ok <- transport.send(socket, iodata) do
-      request_ref = make_ref()
-      request = new_request(request_ref, method, body, encoding)
+        headers =
+          headers
+          |> lower_header_keys()
+          |> add_default_headers(conn)
 
-      if conn.request == nil do
-        conn = %__MODULE__{conn | request: request}
-        {:ok, conn, request_ref}
-      else
-        requests = :queue.in(request, conn.requests)
-        conn = %__MODULE__{conn | requests: requests}
-        {:ok, conn, request_ref}
-      end
-    else
-      {:error, %TransportError{reason: :closed} = error} ->
-        {:error, %{conn | state: :closed}, error}
+        with {:ok, headers, encoding} <- add_content_length_or_transfer_encoding(headers, body),
+             {:ok, iodata} <- Request.encode(method, path, headers, body),
+             :ok <- transport.send(socket, iodata) do
+          request_ref = make_ref()
+          request = new_request(request_ref, method, body, encoding)
 
-      {:error, %error_module{} = error} when error_module in [HTTPError, TransportError] ->
-        {:error, conn, error}
+          if conn.request == nil do
+            conn = %__MODULE__{conn | request: request}
+            {:ok, conn, request_ref}
+          else
+            requests = :queue.in(request, conn.requests)
+            conn = %__MODULE__{conn | requests: requests}
+            {:ok, conn, request_ref}
+          end
+        else
+          {:error, %TransportError{reason: :closed} = error} ->
+            {:error, %{conn | state: :closed}, error}
 
-      {:error, reason} ->
-        {:error, conn, wrap_error(reason)}
+          {:error, %error_module{} = error} when error_module in [HTTPError, TransportError] ->
+            {:error, conn, error}
+
+          {:error, reason} ->
+            {:error, conn, wrap_error(reason)}
+        end
     end
   end
 
@@ -300,27 +296,35 @@ defmodule Mint.HTTP1 do
           iodata() | :eof | {:eof, trailing_headers :: Types.headers()}
         ) ::
           {:ok, t()} | {:error, t(), Types.error()}
-  def stream_request_body(
-        %__MODULE__{request: %{state: {:stream_request, :identity}, ref: ref}} = conn,
-        ref,
-        :eof
-      ) do
-    {:ok, put_in(conn.request.state, :status)}
+
+  def stream_request_body(%__MODULE__{} = conn, ref, body) do
+    stream_request_body(conn, last_request(conn), ref, body)
   end
 
-  def stream_request_body(
-        %__MODULE__{request: %{state: {:stream_request, :identity}, ref: ref}} = conn,
-        ref,
-        {:eof, _trailing_headers}
-      ) do
+  defp stream_request_body(
+         conn,
+         %{state: {:stream_request, :identity}, ref: ref} = request,
+         ref,
+         :eof
+       ) do
+    {:ok, update_last_request(conn, %{request | state: :status})}
+  end
+
+  defp stream_request_body(
+         conn,
+         %{state: {:stream_request, :identity}, ref: ref},
+         ref,
+         {:eof, _trailing_headers}
+       ) do
     {:error, conn, wrap_error(:trailing_headers_but_not_chunked_encoding)}
   end
 
-  def stream_request_body(
-        %__MODULE__{request: %{state: {:stream_request, :identity}, ref: ref}} = conn,
-        ref,
-        body
-      ) do
+  defp stream_request_body(
+         conn,
+         %{state: {:stream_request, :identity}, ref: ref},
+         ref,
+         body
+       ) do
     case conn.transport.send(conn.socket, body) do
       :ok ->
         {:ok, conn}
@@ -333,16 +337,17 @@ defmodule Mint.HTTP1 do
     end
   end
 
-  def stream_request_body(
-        %__MODULE__{request: %{state: {:stream_request, :chunked}, ref: ref}} = conn,
-        ref,
-        chunk
-      ) do
+  defp stream_request_body(
+         conn,
+         %{state: {:stream_request, :chunked}, ref: ref} = request,
+         ref,
+         chunk
+       ) do
     with {:ok, chunk} <- validate_chunk(chunk),
          :ok <- conn.transport.send(conn.socket, Request.encode_chunk(chunk)) do
       case chunk do
-        :eof -> {:ok, put_in(conn.request.state, :status)}
-        {:eof, _trailing_headers} -> {:ok, put_in(conn.request.state, :status)}
+        :eof -> {:ok, update_last_request(conn, %{request | state: :status})}
+        {:eof, _trailing_headers} -> {:ok, update_last_request(conn, %{request | state: :status})}
         _other -> {:ok, conn}
       end
     else
@@ -835,6 +840,22 @@ defmodule Mint.HTTP1 do
       {:empty, requests} ->
         %{conn | request: nil, requests: requests}
     end
+  end
+
+  defp last_request(conn) do
+    case :queue.peek_r(conn.requests) do
+      {:value, request} -> request
+      :empty -> conn.request
+    end
+  end
+
+  defp update_last_request(%{request: %{ref: ref}} = conn, %{ref: ref} = request) do
+    %{conn | request: request}
+  end
+
+  defp update_last_request(conn, %{ref: ref} = request) do
+    {{:value, %{ref: ^ref}}, requests} = :queue.out_r(conn.requests)
+    %{conn | requests: :queue.in(request, requests)}
   end
 
   defp internal_close(conn) do
